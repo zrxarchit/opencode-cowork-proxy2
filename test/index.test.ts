@@ -8,32 +8,49 @@ describe('worker routing', () => {
     vi.restoreAllMocks();
   });
 
-  it('routes /v1/models to Anthropic models endpoint with Anthropic headers', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"data":[]}', { status: 200, headers: { 'Content-Type': 'application/json' } }),
-    );
+  it('lists aliased free models on /v1/models without an API key', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    const request = new Request('https://proxy.example/v1/models');
+
+    const response = await worker.fetch(request);
+    const body: any = await response.json();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(body.object).toBe('list');
+    const ids = body.data.map((m: any) => m.id);
+    // Aliases only — real upstream IDs must never leak here.
+    expect(ids).toContain('claude-opus-1');
+    expect(ids).toContain('claude-opus-2');
+    for (const id of ids) {
+      expect(id).not.toContain('-free');
+    }
+  });
+
+  it('lists aliases in Anthropic format when x-upstream-format is anthropic (no key)', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
 
     const request = new Request('https://proxy.example/v1/models', {
-      headers: {
-        'x-api-key': key,
-        'x-upstream-url': 'https://api.anthropic.com',
-        'x-upstream-format': 'anthropic',
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': 'tools-2024-04-04',
-      },
+      headers: { 'x-upstream-format': 'anthropic' },
     });
 
-    await worker.fetch(request);
+    const response = await worker.fetch(request);
+    const body: any = await response.json();
 
-    expect(fetchMock).toHaveBeenCalledWith('https://api.anthropic.com/v1/models', {
-      method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Api-Key': key,
-        'Anthropic-Version': '2023-06-01',
-        'Anthropic-Beta': 'tools-2024-04-04',
-      },
-    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(body.has_more).toBe(false);
+    expect(body.data[0].id).toBe('claude-opus-1');
+  });
+
+  it('serves the public alias map on /map without an API key', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    const response = await worker.fetch(new Request('https://proxy.example/map'));
+    const body: any = await response.json();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(body['claude-opus-1']).toContain('-free');
   });
 
   it('forwards Anthropic beta header when translating OpenAI requests to Anthropic', async () => {
@@ -138,38 +155,57 @@ describe('worker routing', () => {
     expect(await response.text()).toBe('{"error":"FreeUsageLimitError"}');
   });
 
-  it('routes /go-prefixed model discovery to OpenCode Go models', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"data":[]}', { status: 200, headers: { 'Content-Type': 'application/json' } }),
-    );
+  it('serves the alias list on /go/v1/models and /zen/v1/models without an API key', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
 
-    const request = new Request('https://proxy.example/go/v1/models', {
-      headers: { 'x-api-key': key },
-    });
-
-    await worker.fetch(request);
-
-    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/go/v1/models', {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${key}` },
-    });
+    for (const url of ['https://proxy.example/go/v1/models', 'https://proxy.example/zen/v1/models']) {
+      const response = await worker.fetch(new Request(url));
+      const body: any = await response.json();
+      expect(response.status).toBe(200);
+      expect(body.data.length).toBeGreaterThan(0);
+      expect(body.data[0].id).toBe('claude-opus-1');
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('routes /zen-prefixed model discovery to OpenCode Zen models', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"data":[]}', { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  it('serves the alias map on /go/map and /zen/map without an API key', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    for (const url of ['https://proxy.example/go/map', 'https://proxy.example/zen/map']) {
+      const response = await worker.fetch(new Request(url));
+      const body: any = await response.json();
+      expect(body['claude-opus-1']).toContain('-free');
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('resolves an alias to the real free model on Anthropic requests', async () => {
+    let capturedBody: any = null;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async (_url, init: any) => {
+        capturedBody = JSON.parse(init.body);
+        return new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      },
     );
 
-    const request = new Request('https://proxy.example/zen/v1/models', {
-      headers: { 'x-api-key': key },
+    const request = new Request('https://proxy.example/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({
+        model: 'claude-opus-1',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
     });
 
-    await worker.fetch(request);
-
-    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/models', {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${key}` },
-    });
+    const response = await worker.fetch(request);
+    const body = await response.json();
+    // Upstream gets the real free model...
+    expect(capturedBody.model).toContain('-free');
+    // ...but the client sees its alias echoed back.
+    expect(body.model).toBe('claude-opus-1');
   });
 
   it('overrides model from URL path segment with /go prefix', async () => {

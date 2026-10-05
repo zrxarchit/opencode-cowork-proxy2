@@ -1,5 +1,11 @@
 import { Hono } from 'hono';
 import { extractApiKey, validateApiKey, authErrorResponse } from './auth';
+import {
+  resolveUpstreamModel,
+  buildOpenAIModelsList,
+  buildAnthropicModelsList,
+  buildMapResponse,
+} from './models';
 import { formatAnthropicToOpenAI } from './translate/request/anthropic-to-openai';
 import { formatOpenAIToAnthropic } from './translate/request/openai-to-anthropic';
 import { formatOpenAIToAnthropic as toAnthropicResponse } from './translate/response/openai-to-anthropic';
@@ -13,6 +19,7 @@ const DEFAULT_UPSTREAM = GO_UPSTREAM;
 const VISION_MODEL = "qwen3.6-plus";
 
 const API_START_PATHS = new Set(['v1', 'v2']);
+const RESERVED_SEGMENTS = new Set(['map']);
 
 type RouteConfig = {
   path: string;
@@ -28,7 +35,7 @@ function stripPrefix(path: string, prefix: string): string | null {
 
 function extractModelSegment(path: string): { path: string; model: string | null } {
   const segments = path.replace(/^\/+/, '').split('/');
-  if (segments.length > 0 && segments[0] && !API_START_PATHS.has(segments[0])) {
+  if (segments.length > 0 && segments[0] && !API_START_PATHS.has(segments[0]) && !RESERVED_SEGMENTS.has(segments[0])) {
     return { path: '/' + segments.slice(1).join('/'), model: segments[0] };
   }
   return { path, model: null };
@@ -101,9 +108,10 @@ async function handleRequest(request: Request): Promise<Response> {
       if (err) return authErrorResponse(err);
 
       if (fmt === "openai") {
-        const req = await request.json();
+        const req: any = await request.json();
         const originalModel = req.model;
         if (route.modelOverride) req.model = route.modelOverride;
+        req.model = resolveUpstreamModel(req.model) ?? req.model;
         if (hasImages(req)) {
           req.model = VISION_MODEL;
         }
@@ -129,11 +137,21 @@ async function handleRequest(request: Request): Promise<Response> {
         });
       }
 
-      // Pass-through to Anthropic upstream
+      // Pass-through to Anthropic upstream (still resolves aliases / URL override)
+      const rawText = await request.text();
+      let passthroughBody = rawText;
+      try {
+        const parsed: any = JSON.parse(rawText);
+        if (route.modelOverride) parsed.model = route.modelOverride;
+        parsed.model = resolveUpstreamModel(parsed.model) ?? parsed.model;
+        passthroughBody = JSON.stringify(parsed);
+      } catch {
+        // non-JSON body: forward as-is
+      }
       const res = await fetch(`${upstream}/v1/messages`, {
         method: "POST",
         headers: anthropicHeaders(request, key!),
-        body: await request.text(),
+        body: passthroughBody,
       });
       return res;
   }
@@ -145,7 +163,10 @@ async function handleRequest(request: Request): Promise<Response> {
       if (err) return authErrorResponse(err);
 
       if (fmt === "anthropic") {
-        const req = await request.json();
+        const req: any = await request.json();
+        const originalModel = req.model;
+        if (route.modelOverride) req.model = route.modelOverride;
+        req.model = resolveUpstreamModel(req.model) ?? req.model;
         const anthReq = formatOpenAIToAnthropic(req);
         const res = await fetch(`${upstream}/v1/messages`, {
           method: "POST",
@@ -155,42 +176,65 @@ async function handleRequest(request: Request): Promise<Response> {
         if (!res.ok) return upstreamErrorResponse(res, await res.text());
 
         if (anthReq.stream) {
-          return new Response(streamAnthropicToOpenAI(res.body as ReadableStream, anthReq.model), {
+          return new Response(streamAnthropicToOpenAI(res.body as ReadableStream, originalModel), {
             headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" },
           });
         }
         const data: any = await res.json();
-        return new Response(JSON.stringify(toOpenAIResponse(data, anthReq.model)), {
+        return new Response(JSON.stringify(toOpenAIResponse(data, originalModel)), {
           headers: { "Content-Type": "application/json" },
         });
       }
 
-      // Pass-through to OpenAI upstream
+      // Pass-through to OpenAI upstream (still resolves aliases / URL override)
+      const rawOpenAIText = await request.text();
+      let openAIBody = rawOpenAIText;
+      let openAIOriginalModel: string | null = null;
+      let openAIResolvedModel: string | null = null;
+      try {
+        const parsed: any = JSON.parse(rawOpenAIText);
+        openAIOriginalModel = parsed.model ?? null;
+        if (route.modelOverride) parsed.model = route.modelOverride;
+        parsed.model = resolveUpstreamModel(parsed.model) ?? parsed.model;
+        openAIResolvedModel = parsed.model ?? null;
+        openAIBody = JSON.stringify(parsed);
+      } catch {
+        // non-JSON body: forward as-is
+      }
       const res = await fetch(`${upstream}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
-        body: await request.text(),
+        body: openAIBody,
       });
+      if (res.ok && openAIOriginalModel && openAIResolvedModel && openAIOriginalModel !== openAIResolvedModel) {
+        // Map the response model back to the alias the client asked for.
+        try {
+          const data: any = await res.json();
+          if (data && typeof data.model === "string") data.model = openAIOriginalModel;
+          return new Response(JSON.stringify(data), {
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch {
+          return res;
+        }
+      }
       return res;
   }
 
-  // Model discovery
-  if (route.path === '/v1/models' && request.method === 'GET') {
-      const key = extractApiKey(request.headers);
-      const err = validateApiKey(key);
-      if (err) return authErrorResponse(err);
-
-      const res = fmt === "anthropic"
-        ? await fetch(`${upstream}/v1/models`, {
-            method: "GET",
-            headers: anthropicHeaders(request, key),
-          })
-        : await fetch(`${upstream}/models`, {
-            method: "GET",
-            headers: { "Authorization": `Bearer ${key}` },
+  // Public alias map: which alias resolves to which real upstream model.
+  // Works with /map, /go/map, /zen/map — no API key required, no upstream call.
+  if (route.path === '/map' && request.method === 'GET') {
+      return new Response(JSON.stringify(buildMapResponse(), null, 2), {
+        headers: { "Content-Type": "application/json" },
       });
-      if (!res.ok) return upstreamErrorResponse(res, await res.text());
-      return new Response(await res.text(), { headers: { "Content-Type": "application/json" } });
+  }
+
+  // Public model discovery: lists ONLY free-model aliases
+  // (e.g. claude-opus-1, claude-opus-2, ...) — no API key required,
+  // no upstream call. Real upstream IDs are never exposed here.
+  if (route.path === '/v1/models' && request.method === 'GET') {
+      const body = fmt === "anthropic" ? buildAnthropicModelsList() : buildOpenAIModelsList();
+      return new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } });
   }
 
   return new Response(JSON.stringify({
@@ -201,9 +245,10 @@ async function handleRequest(request: Request): Promise<Response> {
       "/zen": ZEN_UPSTREAM,
     },
     endpoints: {
-      "/v1/messages": "Anthropic → upstream (translated if upstream=openai)",
-      "/v1/chat/completions": "OpenAI → upstream (translated if upstream=anthropic)",
-      "/v1/models": "Model discovery proxy",
+      "/v1/messages": "Anthropic → upstream (translated if upstream=openai, aliases resolved)",
+      "/v1/chat/completions": "OpenAI → upstream (translated if upstream=anthropic, aliases resolved)",
+      "/v1/models": "Public free-model alias list (no auth, e.g. claude-opus-1...)",
+      "/map": "Public alias -> real upstream model map (no auth)",
     },
   }, null, 2), {
     headers: { "Content-Type": "application/json" },
