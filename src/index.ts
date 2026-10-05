@@ -5,9 +5,11 @@ import {
   buildOpenAIModelsList,
   buildAnthropicModelsList,
   buildMapResponse,
+  RESPONSES_PROTOCOL_MODELS,
 } from './models';
 import { getOpenCodeVersion, openCodeUserAgent } from './version';
 import { enforceFreeTierContract, buildToolNameMap, collectOpenAIStream } from './freetier';
+import { failoverCandidates, isRetryableUpstream } from './failover';
 import { formatAnthropicToResponses } from './translate/responses/anthropic-to-responses';
 import { formatResponsesToAnthropic, formatResponsesToChatCompletion } from './translate/responses/responses-to-anthropic';
 import { collectResponsesStream } from './translate/responses/collect';
@@ -33,13 +35,7 @@ type Env = {
   GITHUB_API_KEY?: string;
 };
 
-// Models that only speak the OpenAI Responses protocol on Zen
-// (`ModelProtocolUnsupported` on `/chat/completions` and `/messages`).
-// Add entries here as they are discovered; the proxy translates to/from
-// `/responses` for them transparently.
-const RESPONSES_PROTOCOL_MODELS = new Set([
-  "muse-spark-1.3-contributor-free",
-]);
+
 
 const API_START_PATHS = new Set(['v1', 'v2']);
 const RESERVED_SEGMENTS = new Set(['map']);
@@ -217,7 +213,7 @@ async function handleResponsesRequest(
   });
 }
 
-function upstreamErrorResponse(res: Response, body: string): Response {
+function upstreamErrorResponse(res: { status: number; headers: Headers }, body: string): Response {
   const headers = new Headers();
   for (const name of ["Content-Type", "Retry-After", "RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset"]) {
     const value = res.headers.get(name);
@@ -259,29 +255,52 @@ async function handleRequest(request: Request, env?: Env): Promise<Response> {
         // (e.g. shell -> Bash) so translated calls stay executable downstream.
         const injected = enforceFreeTierContract(openaiReq, clientTools);
         const toolNameMap = buildToolNameMap(injected, clientTools);
-        const res = await fetch(`${upstream}/chat/completions`, {
-          method: "POST",
-          headers: openaiHeaders(request, key!, ua),
-          body: JSON.stringify(openaiReq),
-        });
-        if (!res.ok) return upstreamErrorResponse(res, await res.text());
-
-        if (openaiReq.stream && clientStream) {
-          return new Response(streamOpenAIToAnthropic(res.body as ReadableStream, originalModel, toolNameMap), {
-            headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" },
+        // Fail over across free models on retryable upstream failures. The
+        // client always sees the model name it asked for; failover is flagged
+        // via x-proxy-upstream-model. Streams never switch models mid-response.
+        const candidates = failoverCandidates(req.model, !!route.modelOverride);
+        let firstErr: { status: number; headers: Headers; text: string } | null = null;
+        for (const candidate of candidates) {
+          openaiReq.model = candidate;
+          enforceFreeTierContract(openaiReq, clientTools);
+          const res = await fetch(`${upstream}/chat/completions`, {
+            method: "POST",
+            headers: openaiHeaders(request, key!, ua),
+            body: JSON.stringify(openaiReq),
           });
+          const failedOver = candidate !== candidates[0];
+          const extraHeaders: Record<string, string> = failedOver ? { "x-proxy-upstream-model": candidate } : {};
+          if (res.ok) {
+            if (openaiReq.stream && clientStream) {
+              return new Response(streamOpenAIToAnthropic(res.body as ReadableStream, originalModel, toolNameMap), {
+                headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", ...extraHeaders },
+              });
+            }
+            if (openaiReq.stream && !clientStream) {
+              // Stream was forced for the free-tier gate; reassemble one response.
+              const completion = await collectOpenAIStream(res);
+              return new Response(JSON.stringify(toAnthropicResponse(completion, originalModel, toolNameMap)), {
+                headers: { "Content-Type": "application/json", ...extraHeaders },
+              });
+            }
+            const data: any = await res.json();
+            return new Response(JSON.stringify(toAnthropicResponse(data, originalModel, toolNameMap)), {
+              headers: { "Content-Type": "application/json", ...extraHeaders },
+            });
+          }
+          const errText = await res.text();
+          if (!firstErr) firstErr = { status: res.status, headers: res.headers, text: errText };
+          const exhausted = candidate === candidates[candidates.length - 1];
+          if (exhausted || !isRetryableUpstream(res.status, errText)) {
+            return upstreamErrorResponse(firstErr, firstErr.text);
+          }
+          // Otherwise retry the same request against the next free model.
         }
-        if (openaiReq.stream && !clientStream) {
-          // Stream was forced for the free-tier gate; reassemble one response.
-          const completion = await collectOpenAIStream(res);
-          return new Response(JSON.stringify(toAnthropicResponse(completion, originalModel, toolNameMap)), {
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-        const data: any = await res.json();
-        return new Response(JSON.stringify(toAnthropicResponse(data, originalModel, toolNameMap)), {
-          headers: { "Content-Type": "application/json" },
-        });
+        // Unreachable: candidates always contains at least the requested model.
+        return upstreamErrorResponse(
+          { status: 500, headers: new Headers() },
+          JSON.stringify({ error: { type: "server_error", message: "Proxy failover exhausted without a response." } }),
+        );
       }
 
       // Pass-through to Anthropic upstream (still resolves aliases / URL override)
@@ -365,16 +384,9 @@ async function handleRequest(request: Request, env?: Env): Promise<Response> {
         if (route.modelOverride) parsed.model = route.modelOverride;
         parsed.model = resolveUpstreamModel(parsed.model) ?? parsed.model;
         openAIResolvedModel = parsed.model ?? null;
-        const passthroughClientTools = Array.isArray(parsed.tools)
-          ? parsed.tools
-              .map((t: any) => ({ name: t?.function?.name || t?.name, schema: t?.function?.parameters || t?.input_schema }))
-              .filter((t: any) => typeof t.name === "string")
-          : [];
-        // Responses-protocol models take a separate path (translated below).
-        if (typeof parsed.model !== "string" || !RESPONSES_PROTOCOL_MODELS.has(parsed.model)) {
-          forcedStream = enforceFreeTierContract(parsed, passthroughClientTools).length > 0;
-          openAIBody = JSON.stringify(parsed);
-        }
+        // Note: contract enforcement happens inside the failover loop below.
+        // Enforcing here as well would make the in-loop call a no-op (tools
+        // already present) and wrongly report "not forced".
       } catch {
         // non-JSON body: forward as-is
       }
@@ -415,33 +427,75 @@ async function handleRequest(request: Request, env?: Env): Promise<Response> {
           headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" },
         });
       }
-      const res = await fetch(`${upstream}/chat/completions`, {
+      const withFailoverHeader = (res: Response, candidate: string): Response => {
+        if (parsed && candidate !== openAIResolvedModel) {
+          const headers = new Headers(res.headers);
+          headers.set("x-proxy-upstream-model", candidate);
+          return new Response(res.body, { status: res.status, headers });
+        }
+        return res;
+      };
+      const sendChat = (body: string) => fetch(`${upstream}/chat/completions`, {
         method: "POST",
         headers: openaiHeaders(request, key!, ua),
-        body: openAIBody,
+        body,
       });
-      if (!res.ok) return res;
-      if (forcedStream && !clientStream) {
-        // Stream was forced for the free-tier gate; reassemble one response.
-        const completion = await collectOpenAIStream(res);
-        if (openAIOriginalModel) completion.model = openAIOriginalModel;
-        return new Response(JSON.stringify(completion), {
-          headers: { "Content-Type": "application/json" },
-        });
+      if (!parsed) {
+        // Non-JSON body: forward as-is, no failover possible.
+        return await sendChat(openAIBody);
       }
-      if (res.ok && openAIOriginalModel && openAIResolvedModel && openAIOriginalModel !== openAIResolvedModel) {
-        // Map the response model back to the alias the client asked for.
-        try {
-          const data: any = await res.json();
-          if (data && typeof data.model === "string") data.model = openAIOriginalModel;
-          return new Response(JSON.stringify(data), {
-            headers: { "Content-Type": "application/json" },
-          });
-        } catch {
-          return res;
+      const candidates = failoverCandidates(
+        typeof parsed.model === "string" ? parsed.model : "",
+        !!route.modelOverride,
+      );
+      let firstErr: { status: number; headers: Headers; text: string } | null = null;
+      for (const candidate of candidates) {
+        parsed.model = candidate;
+        const passthroughClientTools = Array.isArray(parsed.tools)
+          ? parsed.tools
+              .map((t: any) => ({ name: t?.function?.name || t?.name, schema: t?.function?.parameters || t?.input_schema }))
+              .filter((t: any) => typeof t.name === "string")
+          : [];
+        forcedStream = enforceFreeTierContract(parsed, passthroughClientTools).length > 0;
+        const res = await sendChat(JSON.stringify(parsed));
+        if (!res.ok) {
+          // No failover candidates: preserve the old raw-error passthrough.
+          if (candidates.length === 1) return res;
+          const errText = await res.text();
+          if (!firstErr) firstErr = { status: res.status, headers: res.headers, text: errText };
+          const exhausted = candidate === candidates[candidates.length - 1];
+          if (exhausted || !isRetryableUpstream(res.status, errText)) {
+            return upstreamErrorResponse(firstErr, firstErr.text);
+          }
+          continue;
         }
+        if (forcedStream && !clientStream) {
+          // Stream was forced for the free-tier gate; reassemble one response.
+          const completion = await collectOpenAIStream(res);
+          if (openAIOriginalModel) completion.model = openAIOriginalModel;
+          const headers: Record<string, string> = { "Content-Type": "application/json" };
+          if (candidate !== openAIResolvedModel) headers["x-proxy-upstream-model"] = candidate;
+          return new Response(JSON.stringify(completion), { headers });
+        }
+        if (openAIOriginalModel && openAIResolvedModel && openAIOriginalModel !== openAIResolvedModel) {
+          // Map the response model back to the alias the client asked for.
+          try {
+            const data: any = await res.json();
+            if (data && typeof data.model === "string") data.model = openAIOriginalModel;
+            const headers: Record<string, string> = { "Content-Type": "application/json" };
+            if (candidate !== openAIResolvedModel) headers["x-proxy-upstream-model"] = candidate;
+            return new Response(JSON.stringify(data), { headers });
+          } catch {
+            return withFailoverHeader(res, candidate);
+          }
+        }
+        return withFailoverHeader(res, candidate);
       }
-      return res;
+      // Unreachable: candidates always contains at least the requested model.
+      return upstreamErrorResponse(
+        { status: 500, headers: new Headers() },
+        JSON.stringify({ error: { type: "server_error", message: "Proxy failover exhausted without a response." } }),
+      );
   }
 
   // Public alias map: which alias resolves to which real upstream model.

@@ -53,6 +53,16 @@ export function listAliases(): string[] {
   return Object.keys(ALIAS_TO_MODEL);
 }
 
+/**
+ * Models that only speak the OpenAI Responses protocol on Zen
+ * (`ModelProtocolUnsupported` on `/chat/completions` and `/messages`).
+ * Add entries here as they are discovered; the proxy translates to/from
+ * `/responses` for them transparently.
+ */
+export const RESPONSES_PROTOCOL_MODELS: ReadonlySet<string> = new Set([
+  "muse-spark-1.3-contributor-free",
+]);
+
 /** OpenAI-compatible `GET /v1/models` body listing ONLY aliases. */
 export function buildOpenAIModelsList() {
   const now = Math.floor(Date.now() / 1000);

@@ -268,6 +268,10 @@ The Worker therefore sends the official client's identity headers on every upstr
 
 If the incoming request already carries any of these headers (e.g. a real OpenCode client calling through the proxy), its values pass through untouched.
 
+### Free-model failover
+
+Free models rate-limit and go down independently, so when a free chat model answers with a retryable failure (429, 502/503/529, 500, or `Model/Endpoint is unavailable`), the Worker retries the identical request against the next free model instead of failing. The client always sees the model name it asked for; failover is flagged with an `x-proxy-upstream-model` response header naming the model that actually answered. No failover happens for paid models, for models pinned via URL override, or on auth (401) / gate (403) errors — those surface immediately. Responses-protocol models currently have no fallback candidates.
+
 Two caveats for free models:
 
 - The injected `shell`/`read` compatibility tools are visible to the model, which may invoke them. On `/v1/messages` the proxy maps these calls back to your own tools (`shell` → your `Bash`, `read` → your `Read`, case-insensitive) and mirrors your parameter schemas into the injected declarations so the arguments fit. Calls that match none of your tools pass through untouched — treat calls to unknown tools as errors/no-ops.

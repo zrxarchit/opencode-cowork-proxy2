@@ -487,6 +487,145 @@ describe('worker routing', () => {
     expect(text).toContain('[DONE]');
   });
 
+  it('fails over to the next free model when the first is rate limited', async () => {
+    const seenModels: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const body = JSON.parse(init.body);
+      seenModels.push(body.model);
+      if (seenModels.length === 1) {
+        return new Response('{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded"}}', {
+          status: 429, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return chatOk();
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    const body: any = await response.json();
+
+    expect(seenModels[0]).toContain('-free');
+    expect(seenModels.length).toBeGreaterThan(1);
+    expect(seenModels[1]).not.toBe(seenModels[0]);
+    expect(response.status).toBe(200);
+    expect(body.model).toBe('claude-opus-x-2');
+    expect(response.headers.get('x-proxy-upstream-model')).toBe(seenModels[1]);
+  });
+
+  it('returns the first error when every free model fails', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{"error":"first-failure"}', {
+        status: 429, headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    expect(response.status).toBe(429);
+    expect(await response.text()).toBe('{"error":"first-failure"}');
+    // Tried the requested model plus every other free chat model.
+    const upstreamCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes('opencode.ai'));
+    expect(upstreamCalls.length).toBeGreaterThan(1);
+  });
+
+  it('does not fail over on non-retryable errors', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{"error":"nope"}', {
+        status: 403, headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    expect(response.status).toBe(403);
+    const upstreamCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes('opencode.ai'));
+    expect(upstreamCalls).toHaveLength(1);
+  });
+
+  it('does not fail over for paid models or pinned URL models', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{"error":"limited"}', {
+        status: 429, headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    for (const url of [
+      'https://proxy.example/zen/v1/messages',
+      'https://proxy.example/zen/mimo-v2.6-flash-free/v1/messages',
+    ]) {
+      const request = new Request(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': key },
+        body: JSON.stringify({
+          model: url.includes('/mimo-') ? 'claude-sonnet-4-5-20250514' : 'deepseek-v4-pro',
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+      const response = await worker.fetch(request);
+      expect(response.status).toBe(429);
+    }
+    const upstreamCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('opencode.ai'));
+    expect(upstreamCalls).toHaveLength(2);
+  });
+
+  it('fails over on the OpenAI passthrough path', async () => {
+    const seenModels: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const body = JSON.parse(init.body);
+      seenModels.push(body.model);
+      if (seenModels.length === 1) {
+        return new Response('{"error":"busy"}', {
+          status: 503, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({
+        id: 'c', object: 'chat.completion', created: 1, model: body.model,
+        choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+
+    const request = new Request('https://proxy.example/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${key}` },
+      body: JSON.stringify({ model: 'claude-opus-x-2', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    expect(response.status).toBe(200);
+    expect(seenModels.length).toBe(2);
+    expect(response.headers.get('x-proxy-upstream-model')).toBe(seenModels[1]);
+  });
+
   it('rejects responses-protocol models on Anthropic-native upstreams with a clear error', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch');
 
@@ -633,7 +772,7 @@ describe('worker routing', () => {
   });
 
   it('preserves upstream rate limit headers on translated errors', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
       new Response('{"error":"FreeUsageLimitError"}', {
         status: 429,
         headers: {
