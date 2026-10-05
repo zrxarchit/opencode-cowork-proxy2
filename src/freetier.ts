@@ -42,13 +42,23 @@ function compatTool(name: string, description: string, schema: any): any {
  * Injected compat tools mirror the parameter schema of the client's own
  * Bash/Read-like tools when present, so that when the model invokes them the
  * translated call fits the client's tool and can be renamed back to it.
+ *
+ * `toolShape` selects the function-tool envelope: chat-completions bodies nest
+ * it under `function`, while the Responses API declares it flat. Sending the
+ * wrong shape means the gate sees no usable tools and answers 403.
  */
-export function enforceFreeTierContract(openaiBody: any, clientTools: ClientTool[] = []): string[] {
+export function enforceFreeTierContract(
+  openaiBody: any,
+  clientTools: ClientTool[] = [],
+  toolShape: "chat" | "responses" = "chat",
+): string[] {
   if (!openaiBody || typeof openaiBody.model !== "string" || !isFreeModelId(openaiBody.model)) {
     return [];
   }
   openaiBody.stream = true;
-  openaiBody.stream_options = { ...(openaiBody.stream_options || {}), include_usage: true };
+  if (toolShape === "chat") {
+    openaiBody.stream_options = { ...(openaiBody.stream_options || {}), include_usage: true };
+  }
   const tools = Array.isArray(openaiBody.tools) ? openaiBody.tools : (openaiBody.tools = []);
   const names = new Set(
     tools.map((t: any) => t?.function?.name || t?.name).filter((n: any) => typeof n === "string"),
@@ -59,13 +69,20 @@ export function enforceFreeTierContract(openaiBody: any, clientTools: ClientTool
       ? hit.schema
       : { type: "object", properties: {} };
   };
+  const inject = (name: string, description: string, schema: any) => {
+    if (toolShape === "responses") {
+      tools.push({ type: "function", name, description, parameters: schema });
+    } else {
+      tools.push(compatTool(name, description, schema));
+    }
+  };
   const injected: string[] = [];
   if (!names.has("shell") && !names.has("bash")) {
-    tools.push(compatTool("shell", "Run a shell command", schemaFor(["bash", "shell"])));
+    inject("shell", "Run a shell command", schemaFor(["bash", "shell"]));
     injected.push("shell");
   }
   if (!names.has("read")) {
-    tools.push(compatTool("read", "Read a file", schemaFor(["read"])));
+    inject("read", "Read a file", schemaFor(["read"]));
     injected.push("read");
   }
   return injected;

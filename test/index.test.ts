@@ -311,10 +311,12 @@ describe('worker routing', () => {
   });
 
   it('serves responses-protocol models to Anthropic clients via /responses', async () => {
+    let capturedBody: any = null;
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
       if (String(url).includes('api.github.com')) {
         return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
+      if (!String(url).includes('api.github.com')) capturedBody = JSON.parse(init.body);
       const sse = [
         'event: response.created',
         'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","model":"muse-spark-1.3-contributor-free","status":"in_progress"}}',
@@ -348,6 +350,12 @@ describe('worker routing', () => {
     expect(body.content[0]).toEqual({ type: 'text', text: 'Hello' });
     expect(body.model).toBe('claude-opus-x-1');
     expect(body.usage.input_tokens).toBe(5);
+    // Responses API declares function tools flat (no `function` envelope).
+    const toolNames = capturedBody.tools.map((t: any) => t.name);
+    expect(toolNames).toContain('shell');
+    expect(toolNames).toContain('read');
+    for (const t of capturedBody.tools) expect(t.function).toBeUndefined();
+    expect(capturedBody.stream).toBe(true);
   });
 
   it('streams responses-protocol models to streaming Anthropic clients', async () => {

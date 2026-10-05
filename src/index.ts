@@ -197,7 +197,7 @@ async function handleResponsesRequest(
   const clientTools = extractClientTools(req.tools);
   const responsesReq = formatAnthropicToResponses(req);
   const clientStream = !!req.stream;
-  const injected = enforceFreeTierContract(responsesReq, clientTools);
+  const injected = enforceFreeTierContract(responsesReq, clientTools, "responses");
   const toolNameMap = buildToolNameMap(injected, clientTools);
   const res = await fetch(`${upstream}/responses`, {
     method: "POST",
@@ -384,7 +384,7 @@ async function handleRequest(request: Request, env?: Env): Promise<Response> {
         const anthReq = formatOpenAIToAnthropic(parsed);
         const clientTools = extractClientTools(anthReq.tools);
         const responsesReq = formatAnthropicToResponses(anthReq);
-        const injected = enforceFreeTierContract(responsesReq, clientTools);
+        const injected = enforceFreeTierContract(responsesReq, clientTools, "responses");
         const toolNameMap = buildToolNameMap(injected, clientTools);
         const responsesRes = await fetch(`${upstream}/responses`, {
           method: "POST",
