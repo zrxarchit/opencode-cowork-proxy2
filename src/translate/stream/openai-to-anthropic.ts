@@ -1,6 +1,6 @@
 import { extractCachedTokens, extractOutputTokens, extractUncachedInputTokens } from '../../cache';
 
-export function streamOpenAIToAnthropic(openaiStream: ReadableStream, model: string): ReadableStream {
+export function streamOpenAIToAnthropic(openaiStream: ReadableStream, model: string, toolNameMap: Record<string, string> = {}): ReadableStream {
   const messageId = "msg_" + Date.now();
 
   const enqueueSSE = (controller: ReadableStreamDefaultController, eventType: string, data: any) => {
@@ -62,7 +62,7 @@ export function streamOpenAIToAnthropic(openaiStream: ReadableStream, model: str
               const toolBlock = {
                 type: "tool_use",
                 id: toolCallId,
-                name: toolCall.function?.name,
+                name: toolNameMap[toolCall.function?.name] ?? toolCall.function?.name,
                 input: {},
               };
 
@@ -105,7 +105,8 @@ export function streamOpenAIToAnthropic(openaiStream: ReadableStream, model: str
               });
             }
           }
-        } else if (delta.reasoning_content) {
+        } else if (delta.reasoning_content || delta.reasoning) {
+          const thinking = delta.reasoning_content ?? delta.reasoning;
           if (isToolUse || hasStartedTextBlock) {
             enqueueSSE(controller, "content_block_stop", {
               type: "content_block_stop",
@@ -148,7 +149,7 @@ export function streamOpenAIToAnthropic(openaiStream: ReadableStream, model: str
           enqueueSSE(controller, "content_block_delta", {
             type: "content_block_delta",
             index: contentBlockIndex,
-            delta: { type: "thinking_delta", thinking: delta.reasoning_content },
+            delta: { type: "thinking_delta", thinking },
           });
         } else if (delta.content) {
           if (isToolUse || hasStartedThinkingBlock) {

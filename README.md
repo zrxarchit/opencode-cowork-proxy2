@@ -254,7 +254,9 @@ The API key is validated locally before any upstream call. Missing or short keys
 
 ### OpenCode Identity (avoids the free-tier 403)
 
-OpenCode's free tier rejects requests that don't look like they come from within OpenCode (`403 OpenCode's free tier can only be used from within OpenCode`). The Worker therefore sends the official client's identity headers on every upstream call:
+OpenCode's free tier rejects requests that don't look like they come from within OpenCode (`403 FreeTierError`). Headers alone are not enough — for free (`*-free`) models the Worker also enforces the rest of the client contract on the upstream request body: `stream: true` (non-streaming requests are rejected outright) plus `shell` and `read` tool declarations. Clients that didn't ask for streaming still get a normal single response back — the Worker reassembles it from the forced stream internally. Paid models are never modified.
+
+The Worker therefore sends the official client's identity headers on every upstream call:
 
 | Upstream header | Value |
 |-----------------|-------|
@@ -265,6 +267,11 @@ OpenCode's free tier rejects requests that don't look like they come from within
 | `x-opencode-project` | `global` |
 
 If the incoming request already carries any of these headers (e.g. a real OpenCode client calling through the proxy), its values pass through untouched.
+
+Two caveats for free models:
+
+- The injected `shell`/`read` compatibility tools are visible to the model, which may invoke them. On `/v1/messages` the proxy maps these calls back to your own tools (`shell` → your `Bash`, `read` → your `Read`, case-insensitive) and mirrors your parameter schemas into the injected declarations so the arguments fit. Calls that match none of your tools pass through untouched — treat calls to unknown tools as errors/no-ops.
+- Some free models only speak the OpenAI Responses API instead of chat completions (currently `muse-spark-1.3-contributor-free`). The proxy detects these (`RESPONSES_PROTOCOL_MODELS` in `src/index.ts`) and translates transparently: Anthropic clients get translated messages/streams, OpenAI clients get completions (streaming OpenAI clients receive a single-chunk SSE event, since the upstream stream is reassembled internally). A few catalog models are temporarily unavailable upstream (`Model is unavailable` / `Endpoint is unavailable`) independent of this proxy.
 
 Optional Worker secret (set via `npx wrangler secret put GITHUB_API_KEY` or the Cloudflare dashboard — never commit it):
 

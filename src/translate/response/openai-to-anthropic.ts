@@ -10,7 +10,7 @@ function parseToolArguments(value: string | undefined): Record<string, unknown> 
   }
 }
 
-export function formatOpenAIToAnthropic(completion: any, model: string): any {
+export function formatOpenAIToAnthropic(completion: any, model: string, toolNameMap: Record<string, string> = {}): any {
   const messageId = "msg_" + Date.now();
 
   let content: any = [];
@@ -28,7 +28,7 @@ export function formatOpenAIToAnthropic(completion: any, model: string): any {
     content.push(...message.tool_calls.map((item: any) => ({
       type: 'tool_use',
       id: item.id,
-      name: item.function?.name,
+      name: toolNameMap[item.function?.name] ?? item.function?.name,
       input: parseToolArguments(item.function?.arguments),
     })));
   }

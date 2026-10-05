@@ -175,10 +175,11 @@ describe('worker routing', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/chat/completions', expect.objectContaining({
       headers: expect.objectContaining({
-        'x-opencode-client': 'opencode',
-        'x-opencode-session-id': expect.stringMatching(/^ses_/),
+        'x-opencode-client': 'cli',
+        'x-opencode-session-id': expect.stringMatching(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/),
         'x-opencode-session': expect.any(String),
         'x-session-affinity': expect.any(String),
+        'x-opencode-request': expect.stringMatching(/^req_/),
       }),
     }));
   });
@@ -202,6 +203,374 @@ describe('worker routing', () => {
     expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/chat/completions', expect.objectContaining({
       headers: expect.objectContaining({ 'x-opencode-session-id': 'ses_customsession123' }),
     }));
+  });
+
+  it('forces stream and shell/read tools upstream for free models', async () => {
+    let capturedBody: any = null;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      capturedBody = JSON.parse(init.body);
+      const sse = [
+        'data: {"id":"c1","model":"mimo-v2.6-flash-free","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}',
+        'data: {"id":"c1","model":"mimo-v2.6-flash-free","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+        'data: [DONE]',
+      ].join('\n');
+      return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    const body: any = await response.json();
+
+    // Gate contract enforced upstream even though the client asked for neither.
+    expect(capturedBody.stream).toBe(true);
+    const toolNames = (capturedBody.tools || []).map((t: any) => t.function?.name);
+    expect(toolNames).toContain('shell');
+    expect(toolNames).toContain('read');
+    // Non-streaming client still gets a single translated message with its alias.
+    expect(body.content[0].text).toBe('ok');
+    expect(body.model).toBe('claude-opus-x-2');
+  });
+
+  it('maps injected shell/read calls back to the client tool names on streams', async () => {
+    let capturedBody: any = null;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      capturedBody = JSON.parse(init.body);
+      const sse = [
+        'data: {"id":"t1","model":"mimo-v2.6-flash-free","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\\"command\\":\\"ls\\"}"}}]},"finish_reason":null}]}',
+        'data: {"id":"t1","model":"mimo-v2.6-flash-free","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+        'data: [DONE]',
+      ].join('\n');
+      return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    });
+
+    const bashSchema = { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] };
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({
+        model: 'claude-opus-x-2',
+        stream: true,
+        tools: [
+          { name: 'Bash', description: 'run', input_schema: bashSchema },
+          { name: 'Read', description: 'read', input_schema: { type: 'object' } },
+        ],
+        messages: [{ role: 'user', content: 'list files' }],
+      }),
+    });
+
+    const response = await worker.fetch(request);
+    const text = await response.text();
+
+    // Injected shell mirrors the client's Bash schema upstream...
+    const shellTool = capturedBody.tools.find((t: any) => t.function?.name === 'shell');
+    expect(shellTool.function.parameters).toEqual(bashSchema);
+    // ...and the streamed call comes back renamed to the client's tool.
+    expect(text).toContain('"name":"Bash"');
+    expect(text).not.toContain('"name":"shell"');
+  });
+
+  it('renames injected tool calls on reassembled non-streaming responses', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const sse = [
+        'data: {"id":"t2","model":"mimo-v2.6-flash-free","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_9","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}',
+        'data: {"id":"t2","model":"mimo-v2.6-flash-free","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+        'data: [DONE]',
+      ].join('\n');
+      return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({
+        model: 'claude-opus-x-2',
+        tools: [{ name: 'Read', description: 'read', input_schema: { type: 'object' } }],
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    const response = await worker.fetch(request);
+    const body: any = await response.json();
+    const toolUse = body.content.find((b: any) => b.type === 'tool_use');
+    expect(toolUse.name).toBe('Read');
+    expect(body.stop_reason).toBe('tool_use');
+  });
+
+  it('serves responses-protocol models to Anthropic clients via /responses', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const sse = [
+        'event: response.created',
+        'data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","model":"muse-spark-1.3-contributor-free","status":"in_progress"}}',
+        '',
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"delta":"Hello"}',
+        '',
+        'event: response.completed',
+        `data: ${JSON.stringify({ type: "response.completed", sequence_number: 2, response: { id: "resp_1", object: "response", status: "completed", model: "muse-spark-1.3-contributor-free", output: [{ type: "message", id: "msg_1", status: "completed", role: "assistant", content: [{ type: "output_text", text: "Hello", annotations: [] }] }], usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 } } })}`,
+        '',
+      ].join('\n');
+      return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-1', max_tokens: 30, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    const body: any = await response.json();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://opencode.ai/zen/v1/responses',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ 'x-opencode-client': 'cli' }),
+      }),
+    );
+    expect(body.content[0]).toEqual({ type: 'text', text: 'Hello' });
+    expect(body.model).toBe('claude-opus-x-1');
+    expect(body.usage.input_tokens).toBe(5);
+  });
+
+  it('streams responses-protocol models to streaming Anthropic clients', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const sse = [
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","output_index":0,"delta":"Hi"}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","sequence_number":2,"response":{"id":"resp_1","object":"response","status":"completed","model":"muse-spark-1.3-contributor-free","output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}',
+        '',
+      ].join('\n');
+      return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-1', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    const text = await response.text();
+    expect(text).toContain('text_delta');
+    expect(text).toContain('message_stop');
+  });
+
+  it('renames responses function calls back to client tools', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const completed = {
+        type: "response.completed",
+        sequence_number: 3,
+        response: {
+          id: "resp_9", object: "response", status: "completed", model: "muse-spark-1.3-contributor-free",
+          output: [{ type: "function_call", id: "fc_1", call_id: "call_7", name: "shell", arguments: '{"command":"ls"}' }],
+          usage: { input_tokens: 6, output_tokens: 3, total_tokens: 9 },
+        },
+      };
+      return new Response(`event: response.completed\ndata: ${JSON.stringify(completed)}\n\n`, {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      });
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({
+        model: 'claude-opus-x-1',
+        tools: [{ name: 'Bash', description: 'run', input_schema: { type: 'object' } }],
+        messages: [{ role: 'user', content: 'list files' }],
+      }),
+    });
+
+    const response = await worker.fetch(request);
+    const body: any = await response.json();
+    const toolUse = body.content.find((b: any) => b.type === 'tool_use');
+    expect(toolUse.name).toBe('Bash');
+    expect(toolUse.input).toEqual({ command: 'ls' });
+    expect(body.stop_reason).toBe('tool_use');
+  });
+
+  it('serves responses-protocol models to OpenAI clients as completions', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const completed = {
+        type: "response.completed",
+        sequence_number: 2,
+        response: {
+          id: "resp_2", object: "response", status: "completed", model: "muse-spark-1.3-contributor-free",
+          output: [{ type: "message", id: "m1", status: "completed", role: "assistant", content: [{ type: "output_text", text: "ok", annotations: [] }] }],
+          usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
+        },
+      };
+      return new Response(`event: response.completed\ndata: ${JSON.stringify(completed)}\n\n`, {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      });
+    });
+
+    const request = new Request('https://proxy.example/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${key}` },
+      body: JSON.stringify({ model: 'claude-opus-x-1', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    const body: any = await response.json();
+    expect(body.object).toBe('chat.completion');
+    expect(body.choices[0].message.content).toBe('ok');
+    expect(body.model).toBe('claude-opus-x-1');
+  });
+
+  it('serves responses-protocol models to streaming OpenAI clients as one chunk', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const completed = {
+        type: "response.completed",
+        sequence_number: 2,
+        response: {
+          id: "resp_3", object: "response", status: "completed", model: "muse-spark-1.3-contributor-free",
+          output: [{ type: "message", id: "m1", status: "completed", role: "assistant", content: [{ type: "output_text", text: "ok", annotations: [] }] }],
+          usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
+        },
+      };
+      return new Response(`event: response.completed\ndata: ${JSON.stringify(completed)}\n\n`, {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      });
+    });
+
+    const request = new Request('https://proxy.example/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${key}` },
+      body: JSON.stringify({ model: 'claude-opus-x-1', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    const text = await response.text();
+    expect(response.headers.get('Content-Type')).toContain('text/event-stream');
+    expect(text).toContain('chat.completion.chunk');
+    expect(text).toContain('[DONE]');
+  });
+
+  it('rejects responses-protocol models on Anthropic-native upstreams with a clear error', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    const request = new Request('https://proxy.example/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${key}`,
+        'x-upstream-url': 'https://api.anthropic.com',
+        'x-upstream-format': 'anthropic',
+      },
+      body: JSON.stringify({ model: 'claude-opus-x-1', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    expect(response.status).toBe(400);
+    const upstreamCalls = fetchMock.mock.calls.filter(([url]) => !String(url).includes('api.github.com'));
+    expect(upstreamCalls).toHaveLength(0);
+  });
+
+  it('streams provider reasoning deltas as thinking blocks', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const sse = [
+        'data: {"id":"t3","model":"mimo-v2.6-flash-free","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"let me think"},"finish_reason":null}]}',
+        'data: {"id":"t3","model":"mimo-v2.6-flash-free","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}',
+        'data: [DONE]',
+      ].join('\n');
+      return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-2', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    const text = await response.text();
+    expect(text).toContain('thinking_delta');
+    expect(text).toContain('let me think');
+  });
+
+  it('leaves paid models untouched (no forced stream or tools)', async () => {
+    let capturedBody: any = null;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      capturedBody = JSON.parse(init.body);
+      return chatOk();
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'deepseek-v4-pro', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    await worker.fetch(request);
+
+    expect(capturedBody.stream).toBeUndefined();
+    expect(capturedBody.tools).toBeUndefined();
+  });
+
+  it('reassembles one completion for non-streaming OpenAI clients on free models', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      const sse = [
+        'data: {"id":"c2","model":"mimo-v2.6-flash-free","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}',
+        'data: {"id":"c2","model":"mimo-v2.6-flash-free","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}',
+        'data: [DONE]',
+      ].join('\n');
+      return new Response(sse, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    });
+
+    const request = new Request('https://proxy.example/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${key}` },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+    const body: any = await response.json();
+
+    expect(body.object).toBe('chat.completion');
+    expect(body.choices[0].message.content).toBe('hi');
+    expect(body.model).toBe('claude-opus-x-2');
   });
 
   it('builds the upstream User-Agent from the latest stable GitHub release', async () => {

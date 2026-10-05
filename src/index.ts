@@ -7,6 +7,11 @@ import {
   buildMapResponse,
 } from './models';
 import { getOpenCodeVersion, openCodeUserAgent } from './version';
+import { enforceFreeTierContract, buildToolNameMap, collectOpenAIStream } from './freetier';
+import { formatAnthropicToResponses } from './translate/responses/anthropic-to-responses';
+import { formatResponsesToAnthropic, formatResponsesToChatCompletion } from './translate/responses/responses-to-anthropic';
+import { collectResponsesStream } from './translate/responses/collect';
+import { streamResponsesToAnthropic } from './translate/stream/responses-to-anthropic';
 import { formatAnthropicToOpenAI } from './translate/request/anthropic-to-openai';
 import { formatOpenAIToAnthropic } from './translate/request/openai-to-anthropic';
 import { formatOpenAIToAnthropic as toAnthropicResponse } from './translate/response/openai-to-anthropic';
@@ -27,6 +32,14 @@ const VISION_MODEL = "qwen3.6-plus";
 type Env = {
   GITHUB_API_KEY?: string;
 };
+
+// Models that only speak the OpenAI Responses protocol on Zen
+// (`ModelProtocolUnsupported` on `/chat/completions` and `/messages`).
+// Add entries here as they are discovered; the proxy translates to/from
+// `/responses` for them transparently.
+const RESPONSES_PROTOCOL_MODELS = new Set([
+  "muse-spark-1.3-contributor-free",
+]);
 
 const API_START_PATHS = new Set(['v1', 'v2']);
 const RESERVED_SEGMENTS = new Set(['map']);
@@ -84,10 +97,21 @@ function upstreamUserAgent(request: Request, version: string): string {
   return ua && ua.startsWith("opencode/") ? ua : openCodeUserAgent(version);
 }
 
-function randomId(prefix: string, len = 26): string {
-  const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+function randomFrom(alphabet: string, len: number): string {
   const bytes = crypto.getRandomValues(new Uint8Array(len));
-  return prefix + Array.from(bytes, (b) => chars[b % chars.length]).join("");
+  return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join("");
+}
+
+const HEX = "0123456789abcdef";
+const ALNUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/** Session IDs look like `ses_<12 lowercase hex><14 alphanumerics>`. */
+function randomSessionId(): string {
+  return `ses_${randomFrom(HEX, 12)}${randomFrom(ALNUM, 14)}`;
+}
+
+function randomRequestId(): string {
+  return `req_${randomFrom(ALNUM, 26)}`;
 }
 
 /**
@@ -101,14 +125,15 @@ function randomId(prefix: string, len = 26): string {
  */
 function openCodeIdentityHeaders(request: Request): Record<string, string> {
   const get = (name: string) => request.headers.get(name);
-  const sessionId = get("x-opencode-session-id") || randomId("ses_");
+  const sessionId = get("x-opencode-session-id") || randomSessionId();
   const affinity = get("x-session-affinity") || get("x-session-id") || get("x-opencode-session") || sessionId;
   const headers: Record<string, string> = {
     "x-opencode-session-id": sessionId,
     "x-session-affinity": affinity,
     "X-Session-Id": affinity,
     "x-opencode-session": affinity,
-    "x-opencode-client": get("x-opencode-client") || "opencode",
+    "x-opencode-request": get("x-opencode-request") || randomRequestId(),
+    "x-opencode-client": get("x-opencode-client") || "cli",
     "x-opencode-project": get("x-opencode-project") || "global",
   };
   const parent = get("x-opencode-parent-session-id") || get("x-parent-session-id");
@@ -149,6 +174,49 @@ function hasImages(body: any): boolean {
   );
 }
 
+function extractClientTools(anthropicTools: any): { name: string; schema?: any }[] {
+  return Array.isArray(anthropicTools)
+    ? anthropicTools
+        .map((t: any) => ({ name: t.name, schema: t.input_schema }))
+        .filter((t: any) => typeof t.name === "string")
+    : [];
+}
+
+/**
+ * Anthropic client -> Responses-protocol upstream model (e.g. Muse Spark).
+ * Handles both streaming and non-streaming clients.
+ */
+async function handleResponsesRequest(
+  request: Request,
+  req: any,
+  upstream: string,
+  key: string,
+  ua: string,
+  originalModel: string,
+): Promise<Response> {
+  const clientTools = extractClientTools(req.tools);
+  const responsesReq = formatAnthropicToResponses(req);
+  const clientStream = !!req.stream;
+  const injected = enforceFreeTierContract(responsesReq, clientTools);
+  const toolNameMap = buildToolNameMap(injected, clientTools);
+  const res = await fetch(`${upstream}/responses`, {
+    method: "POST",
+    headers: openaiHeaders(request, key, ua),
+    body: JSON.stringify(responsesReq),
+  });
+  if (!res.ok) return upstreamErrorResponse(res, await res.text());
+
+  if (clientStream) {
+    return new Response(streamResponsesToAnthropic(res.body as ReadableStream, originalModel, toolNameMap), {
+      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" },
+    });
+  }
+  const completed = await collectResponsesStream(res);
+  return new Response(JSON.stringify(formatResponsesToAnthropic(completed, originalModel, toolNameMap)), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 function upstreamErrorResponse(res: Response, body: string): Response {
   const headers = new Headers();
   for (const name of ["Content-Type", "Retry-After", "RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset"]) {
@@ -179,7 +247,18 @@ async function handleRequest(request: Request, env?: Env): Promise<Response> {
         if (hasImages(req)) {
           req.model = VISION_MODEL;
         }
+        // Models that only speak the Responses protocol take a separate path.
+        if (RESPONSES_PROTOCOL_MODELS.has(req.model)) {
+          return await handleResponsesRequest(request, req, upstream, key!, ua, originalModel);
+        }
+        const clientTools = extractClientTools(req.tools);
         const openaiReq = formatAnthropicToOpenAI(req);
+        const clientStream = !!req.stream;
+        // Free models are gated: the upstream requires stream + shell/read tools.
+        // Injected compat tools are mapped back to the client's own tool names
+        // (e.g. shell -> Bash) so translated calls stay executable downstream.
+        const injected = enforceFreeTierContract(openaiReq, clientTools);
+        const toolNameMap = buildToolNameMap(injected, clientTools);
         const res = await fetch(`${upstream}/chat/completions`, {
           method: "POST",
           headers: openaiHeaders(request, key!, ua),
@@ -187,13 +266,20 @@ async function handleRequest(request: Request, env?: Env): Promise<Response> {
         });
         if (!res.ok) return upstreamErrorResponse(res, await res.text());
 
-        if (openaiReq.stream) {
-          return new Response(streamOpenAIToAnthropic(res.body as ReadableStream, originalModel), {
+        if (openaiReq.stream && clientStream) {
+          return new Response(streamOpenAIToAnthropic(res.body as ReadableStream, originalModel, toolNameMap), {
             headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" },
           });
         }
+        if (openaiReq.stream && !clientStream) {
+          // Stream was forced for the free-tier gate; reassemble one response.
+          const completion = await collectOpenAIStream(res);
+          return new Response(JSON.stringify(toAnthropicResponse(completion, originalModel, toolNameMap)), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
         const data: any = await res.json();
-        return new Response(JSON.stringify(toAnthropicResponse(data, originalModel)), {
+        return new Response(JSON.stringify(toAnthropicResponse(data, originalModel, toolNameMap)), {
           headers: { "Content-Type": "application/json" },
         });
       }
@@ -205,6 +291,14 @@ async function handleRequest(request: Request, env?: Env): Promise<Response> {
         const parsed: any = JSON.parse(rawText);
         if (route.modelOverride) parsed.model = route.modelOverride;
         parsed.model = resolveUpstreamModel(parsed.model) ?? parsed.model;
+        if (typeof parsed.model === "string" && RESPONSES_PROTOCOL_MODELS.has(parsed.model)) {
+          return new Response(JSON.stringify({
+            error: {
+              type: "invalid_request_error",
+              message: `Model ${parsed.model} only speaks the OpenAI Responses protocol and cannot be served through an Anthropic-native upstream. Point the worker at an OpenAI-compatible upstream (default) instead.`,
+            },
+          }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
         passthroughBody = JSON.stringify(parsed);
       } catch {
         // non-JSON body: forward as-is
@@ -229,6 +323,14 @@ async function handleRequest(request: Request, env?: Env): Promise<Response> {
         const originalModel = req.model;
         if (route.modelOverride) req.model = route.modelOverride;
         req.model = resolveUpstreamModel(req.model) ?? req.model;
+        if (typeof req.model === "string" && RESPONSES_PROTOCOL_MODELS.has(req.model)) {
+          return new Response(JSON.stringify({
+            error: {
+              type: "invalid_request_error",
+              message: `Model ${originalModel} only speaks the OpenAI Responses protocol and cannot be served through an Anthropic-native upstream. Point the worker at an OpenAI-compatible upstream (default) instead.`,
+            },
+          }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
         const anthReq = formatOpenAIToAnthropic(req);
         const res = await fetch(`${upstream}/v1/messages`, {
           method: "POST",
@@ -253,21 +355,80 @@ async function handleRequest(request: Request, env?: Env): Promise<Response> {
       let openAIBody = rawOpenAIText;
       let openAIOriginalModel: string | null = null;
       let openAIResolvedModel: string | null = null;
+      let forcedStream = false;
+      let clientStream = false;
+      let parsed: any = null;
       try {
-        const parsed: any = JSON.parse(rawOpenAIText);
+        parsed = JSON.parse(rawOpenAIText);
         openAIOriginalModel = parsed.model ?? null;
+        clientStream = !!parsed.stream;
         if (route.modelOverride) parsed.model = route.modelOverride;
         parsed.model = resolveUpstreamModel(parsed.model) ?? parsed.model;
         openAIResolvedModel = parsed.model ?? null;
-        openAIBody = JSON.stringify(parsed);
+        const passthroughClientTools = Array.isArray(parsed.tools)
+          ? parsed.tools
+              .map((t: any) => ({ name: t?.function?.name || t?.name, schema: t?.function?.parameters || t?.input_schema }))
+              .filter((t: any) => typeof t.name === "string")
+          : [];
+        // Responses-protocol models take a separate path (translated below).
+        if (typeof parsed.model !== "string" || !RESPONSES_PROTOCOL_MODELS.has(parsed.model)) {
+          forcedStream = enforceFreeTierContract(parsed, passthroughClientTools).length > 0;
+          openAIBody = JSON.stringify(parsed);
+        }
       } catch {
         // non-JSON body: forward as-is
+      }
+      // Responses-protocol upstream (e.g. Muse Spark): chat -> responses,
+      // always collected, then returned as one completion (or one SSE chunk).
+      if (parsed && typeof parsed.model === "string" && RESPONSES_PROTOCOL_MODELS.has(parsed.model)) {
+        const anthReq = formatOpenAIToAnthropic(parsed);
+        const clientTools = extractClientTools(anthReq.tools);
+        const responsesReq = formatAnthropicToResponses(anthReq);
+        const injected = enforceFreeTierContract(responsesReq, clientTools);
+        const toolNameMap = buildToolNameMap(injected, clientTools);
+        const responsesRes = await fetch(`${upstream}/responses`, {
+          method: "POST",
+          headers: openaiHeaders(request, key!, ua),
+          body: JSON.stringify(responsesReq),
+        });
+        if (!responsesRes.ok) return upstreamErrorResponse(responsesRes, await responsesRes.text());
+        const completed = await collectResponsesStream(responsesRes);
+        const completion = formatResponsesToChatCompletion(completed, openAIOriginalModel || parsed.model, toolNameMap);
+        if (!clientStream) {
+          return new Response(JSON.stringify(completion), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        const msg = completion.choices[0].message;
+        const chunk: any = {
+          id: completion.id,
+          object: "chat.completion.chunk",
+          created: completion.created,
+          model: completion.model,
+          choices: [{
+            index: 0,
+            delta: { role: "assistant", content: msg.content, ...(msg.tool_calls ? { tool_calls: msg.tool_calls.map((tc: any, i: number) => ({ ...tc, index: i })) } : {}) },
+            finish_reason: completion.choices[0].finish_reason,
+          }],
+        };
+        return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, {
+          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" },
+        });
       }
       const res = await fetch(`${upstream}/chat/completions`, {
         method: "POST",
         headers: openaiHeaders(request, key!, ua),
         body: openAIBody,
       });
+      if (!res.ok) return res;
+      if (forcedStream && !clientStream) {
+        // Stream was forced for the free-tier gate; reassemble one response.
+        const completion = await collectOpenAIStream(res);
+        if (openAIOriginalModel) completion.model = openAIOriginalModel;
+        return new Response(JSON.stringify(completion), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       if (res.ok && openAIOriginalModel && openAIResolvedModel && openAIOriginalModel !== openAIResolvedModel) {
         // Map the response model back to the alias the client asked for.
         try {
