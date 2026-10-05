@@ -6,6 +6,7 @@ import {
   buildAnthropicModelsList,
   buildMapResponse,
 } from './models';
+import { getOpenCodeVersion, openCodeUserAgent } from './version';
 import { formatAnthropicToOpenAI } from './translate/request/anthropic-to-openai';
 import { formatOpenAIToAnthropic } from './translate/request/openai-to-anthropic';
 import { formatOpenAIToAnthropic as toAnthropicResponse } from './translate/response/openai-to-anthropic';
@@ -17,6 +18,15 @@ const GO_UPSTREAM = "https://opencode.ai/zen/go/v1";
 const ZEN_UPSTREAM = "https://opencode.ai/zen/v1";
 const DEFAULT_UPSTREAM = GO_UPSTREAM;
 const VISION_MODEL = "qwen3.6-plus";
+
+// opencode.ai's free tier rejects requests that don't look like they come
+// from within OpenCode (403), so every upstream call carries the official
+// client User-Agent (`opencode/<channel>/<version>/<name>`, see App.useragent
+// in opencode's packages/core/src/app.ts). The version tracks the latest
+// stable GitHub release; see src/version.ts.
+type Env = {
+  GITHUB_API_KEY?: string;
+};
 
 const API_START_PATHS = new Set(['v1', 'v2']);
 const RESERVED_SEGMENTS = new Set(['map']);
@@ -68,11 +78,26 @@ function upstreamFormat(request: Request): "openai" | "anthropic" {
   return fmt === "anthropic" ? "anthropic" : "openai";
 }
 
-function anthropicHeaders(request: Request, key: string): Record<string, string> {
+/** Prefer the caller's UA when it already looks like OpenCode, else mimic the official client. */
+function upstreamUserAgent(request: Request, version: string): string {
+  const ua = request.headers.get("User-Agent");
+  return ua && ua.startsWith("opencode/") ? ua : openCodeUserAgent(version);
+}
+
+function openaiHeaders(request: Request, key: string, ua: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${key}`,
+    "User-Agent": ua,
+  };
+}
+
+function anthropicHeaders(request: Request, key: string, ua: string): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Api-Key": key,
     "Anthropic-Version": request.headers.get("Anthropic-Version") || "2023-06-01",
+    "User-Agent": ua,
   };
   const beta = request.headers.get("Anthropic-Beta");
   if (beta) headers["Anthropic-Beta"] = beta;
@@ -96,7 +121,7 @@ function upstreamErrorResponse(res: Response, body: string): Response {
   return new Response(body, { status: res.status, headers });
 }
 
-async function handleRequest(request: Request): Promise<Response> {
+async function handleRequest(request: Request, env?: Env): Promise<Response> {
   const route = routeConfig(request);
   const upstream = getUpstream(request, route.upstream);
   const fmt = upstreamFormat(request);
@@ -106,6 +131,8 @@ async function handleRequest(request: Request): Promise<Response> {
       const key = extractApiKey(request.headers);
       const err = validateApiKey(key);
       if (err) return authErrorResponse(err);
+      // Resolve once per request; public GET routes below never touch GitHub.
+      const ua = upstreamUserAgent(request, await getOpenCodeVersion(env));
 
       if (fmt === "openai") {
         const req: any = await request.json();
@@ -118,10 +145,7 @@ async function handleRequest(request: Request): Promise<Response> {
         const openaiReq = formatAnthropicToOpenAI(req);
         const res = await fetch(`${upstream}/chat/completions`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${key}`,
-          },
+          headers: openaiHeaders(request, key!, ua),
           body: JSON.stringify(openaiReq),
         });
         if (!res.ok) return upstreamErrorResponse(res, await res.text());
@@ -150,7 +174,7 @@ async function handleRequest(request: Request): Promise<Response> {
       }
       const res = await fetch(`${upstream}/v1/messages`, {
         method: "POST",
-        headers: anthropicHeaders(request, key!),
+        headers: anthropicHeaders(request, key!, ua),
         body: passthroughBody,
       });
       return res;
@@ -161,6 +185,7 @@ async function handleRequest(request: Request): Promise<Response> {
       const key = extractApiKey(request.headers);
       const err = validateApiKey(key);
       if (err) return authErrorResponse(err);
+      const ua = upstreamUserAgent(request, await getOpenCodeVersion(env));
 
       if (fmt === "anthropic") {
         const req: any = await request.json();
@@ -170,7 +195,7 @@ async function handleRequest(request: Request): Promise<Response> {
         const anthReq = formatOpenAIToAnthropic(req);
         const res = await fetch(`${upstream}/v1/messages`, {
           method: "POST",
-          headers: anthropicHeaders(request, key!),
+          headers: anthropicHeaders(request, key!, ua),
           body: JSON.stringify(anthReq),
         });
         if (!res.ok) return upstreamErrorResponse(res, await res.text());
@@ -203,7 +228,7 @@ async function handleRequest(request: Request): Promise<Response> {
       }
       const res = await fetch(`${upstream}/chat/completions`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+        headers: openaiHeaders(request, key!, ua),
         body: openAIBody,
       });
       if (res.ok && openAIOriginalModel && openAIResolvedModel && openAIOriginalModel !== openAIResolvedModel) {
@@ -256,7 +281,7 @@ async function handleRequest(request: Request): Promise<Response> {
   });
 }
 
-const app = new Hono();
-app.all('*', (c) => handleRequest(c.req.raw));
+const app = new Hono<{ Bindings: Env }>();
+app.all('*', (c) => handleRequest(c.req.raw, c.env));
 
 export default app;

@@ -1,11 +1,19 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import worker from '../src/index';
+import { resetVersionCache, DEFAULT_OPENCODE_VERSION } from '../src/version';
 
 const key = 'a'.repeat(32);
+
+const chatOk = () =>
+  new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
 
 describe('worker routing', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    resetVersionCache();
   });
 
   it('lists aliased free models on /v1/models without an API key', async () => {
@@ -54,7 +62,7 @@ describe('worker routing', () => {
   });
 
   it('forwards Anthropic beta header when translating OpenAI requests to Anthropic', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
       new Response(JSON.stringify({ content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -85,12 +93,7 @@ describe('worker routing', () => {
   });
 
   it('routes /go-prefixed Anthropic requests to OpenCode Go', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => chatOk());
 
     const request = new Request('https://proxy.example/go/v1/messages', {
       method: 'POST',
@@ -107,12 +110,7 @@ describe('worker routing', () => {
   });
 
   it('routes /zen-prefixed Anthropic requests to OpenCode Zen', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => chatOk());
 
     const request = new Request('https://proxy.example/zen/v1/messages', {
       method: 'POST',
@@ -125,6 +123,93 @@ describe('worker routing', () => {
     expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/chat/completions', expect.objectContaining({
       method: 'POST',
       headers: expect.objectContaining({ Authorization: `Bearer ${key}` }),
+    }));
+  });
+
+  it('sends the official OpenCode User-Agent on upstream chat requests', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => chatOk());
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    await worker.fetch(request);
+
+    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/chat/completions', expect.objectContaining({
+      headers: expect.objectContaining({ 'User-Agent': expect.stringMatching(/^opencode\//) }),
+    }));
+  });
+
+  it('passes through the caller User-Agent when it already looks like OpenCode', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => chatOk());
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': key,
+        'user-agent': 'opencode/dev/9.9.9/opencode',
+      },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    await worker.fetch(request);
+
+    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/chat/completions', expect.objectContaining({
+      headers: expect.objectContaining({ 'User-Agent': 'opencode/dev/9.9.9/opencode' }),
+    }));
+  });
+
+  it('builds the upstream User-Agent from the latest stable GitHub release', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
+      if (String(url).includes('api.github.com')) {
+        expect(init.headers.Authorization).toBe('Bearer test-github-key');
+        return new Response(JSON.stringify({ tag_name: 'v9.9.9' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return chatOk();
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    await worker.fetch(request, { GITHUB_API_KEY: 'test-github-key' });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.github.com/repos/anomalyco/opencode/releases/latest',
+      expect.anything(),
+    );
+    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/chat/completions', expect.objectContaining({
+      headers: expect.objectContaining({ 'User-Agent': 'opencode/stable/9.9.9/opencode' }),
+    }));
+  });
+
+  it('falls back to the built-in version when GitHub is unreachable', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
+      if (String(url).includes('api.github.com')) {
+        return new Response('rate limited', { status: 403 });
+      }
+      return chatOk();
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const response = await worker.fetch(request);
+
+    expect(response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/chat/completions', expect.objectContaining({
+      headers: expect.objectContaining({ 'User-Agent': `opencode/stable/${DEFAULT_OPENCODE_VERSION}/opencode` }),
     }));
   });
 
@@ -261,12 +346,7 @@ describe('worker routing', () => {
   });
 
   it('returns original model name in response body when model override is active', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => chatOk());
 
     const request = new Request('https://proxy.example/go/minimax-m2.5-free/v1/messages', {
       method: 'POST',
@@ -310,8 +390,8 @@ describe('worker routing', () => {
   it('overrides model to qwen3.6-plus when image attachments are present on the go path', async () => {
     let capturedBody: any = null;
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(
-      async (_url, init: any) => {
-        capturedBody = JSON.parse(init.body);
+      async (_url: any, init: any) => {
+        if (init?.body) capturedBody = JSON.parse(init.body);
         return new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -336,7 +416,8 @@ describe('worker routing', () => {
     });
 
     await worker.fetch(request);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const upstreamCalls = fetchMock.mock.calls.filter(([url]) => String(url).includes('opencode.ai'));
+    expect(upstreamCalls).toHaveLength(1);
     expect(capturedBody.model).toBe('qwen3.6-plus');
     expect(Array.isArray(capturedBody.messages[0].content)).toBe(true);
     expect(capturedBody.messages[0].content).toEqual([

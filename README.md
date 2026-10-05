@@ -252,6 +252,16 @@ Optional request headers:
 
 The API key is validated locally before any upstream call. Missing or short keys receive a 401 response.
 
+### OpenCode Identity (avoids the free-tier 403)
+
+OpenCode's free tier rejects requests that don't look like they come from within OpenCode (`403 OpenCode's free tier can only be used from within OpenCode`). The Worker therefore sends the official client's `User-Agent` (`opencode/stable/<version>/opencode`) on every upstream call, where `<version>` tracks the latest stable [anomalyco/opencode release](https://github.com/anomalyco/opencode/releases) via the GitHub API (cached 5 minutes per isolate, falls back to a built-in version if GitHub is unreachable).
+
+Optional Worker secret (set via `npx wrangler secret put GITHUB_API_KEY` or the Cloudflare dashboard — never commit it):
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `GITHUB_API_KEY` | no | GitHub token for release checks. Works without one (60 req/hour shared quota), but a token raises it to 5,000 req/hour. Needs no scopes for a public repo. |
+
 Prefix routes:
 
 | Path prefix | Upstream base URL |
