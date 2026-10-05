@@ -222,15 +222,15 @@ async function handleRequest(request: Request): Promise<Response> {
   }
 
   // Public alias map: which alias resolves to which real upstream model.
-  // Works with /map, /go/map, /zen/map — no API key required, no upstream call.
-  if (route.path === '/map' && request.method === 'GET') {
+  // Works with /v1/map, /go/v1/map, /zen/v1/map — no API key required, no upstream call.
+  if (route.path === '/v1/map' && request.method === 'GET') {
       return new Response(JSON.stringify(buildMapResponse(), null, 2), {
         headers: { "Content-Type": "application/json" },
       });
   }
 
   // Public model discovery: lists ONLY free-model aliases
-  // (e.g. claude-opus-1, claude-opus-2, ...) — no API key required,
+  // (e.g. claude-opus-x-1, claude-opus-x-2, ...) — no API key required,
   // no upstream call. Real upstream IDs are never exposed here.
   if (route.path === '/v1/models' && request.method === 'GET') {
       const body = fmt === "anthropic" ? buildAnthropicModelsList() : buildOpenAIModelsList();
@@ -247,8 +247,8 @@ async function handleRequest(request: Request): Promise<Response> {
     endpoints: {
       "/v1/messages": "Anthropic → upstream (translated if upstream=openai, aliases resolved)",
       "/v1/chat/completions": "OpenAI → upstream (translated if upstream=anthropic, aliases resolved)",
-      "/v1/models": "Public free-model alias list (no auth, e.g. claude-opus-1...)",
-      "/map": "Public alias -> real upstream model map (no auth)",
+      "/v1/models": "Public free-model alias list (no auth, e.g. claude-opus-x-1...)",
+      "/v1/map": "Public alias -> real upstream model map (no auth)",
     },
   }, null, 2), {
     headers: { "Content-Type": "application/json" },

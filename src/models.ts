@@ -2,7 +2,7 @@
  * Static alias map for free upstream models.
  *
  * The proxy lists ONLY these aliases on GET /v1/models (no API key required),
- * e.g. `claude-opus-1`, `claude-opus-2`, ... instead of exposing the real
+ * e.g. `claude-opus-x-1`, `claude-opus-x-2`, ... instead of exposing the real
  * upstream IDs directly. POST /v1/messages and POST /v1/chat/completions
  * transparently resolve an alias back to its real upstream model ID.
  *
@@ -15,14 +15,14 @@
  */
 
 export const ALIAS_TO_MODEL: Record<string, string> = {
-  "claude-opus-1": "muse-spark-1.3-contributor-free",
-  "claude-opus-2": "mimo-v2.6-flash-free",
-  "claude-opus-3": "ling-3.1-flash-free",
-  "claude-opus-4": "deepseek-v4-flash-free",
-  "claude-opus-5": "mimo-v2.5-free",
-  "claude-opus-6": "north-mini-code-free",
-  "claude-opus-7": "nemotron-3-ultra-free",
-  "claude-opus-8": "minimax-m2.5-free",
+  "claude-opus-x-1": "muse-spark-1.3-contributor-free",
+  "claude-opus-x-2": "mimo-v2.6-flash-free",
+  "claude-opus-x-3": "ling-3.1-flash-free",
+  "claude-opus-x-4": "deepseek-v4-flash-free",
+  "claude-opus-x-5": "mimo-v2.5-free",
+  "claude-opus-x-6": "north-mini-code-free",
+  "claude-opus-x-7": "nemotron-3-ultra-free",
+  "claude-opus-x-8": "minimax-m2.5-free",
 };
 
 export const MODEL_TO_ALIAS: Record<string, string> = Object.fromEntries(
@@ -79,7 +79,7 @@ export function buildAnthropicModelsList() {
   };
 }
 
-/** GET /map body: alias -> real upstream model. */
+/** GET /v1/map body: alias -> real upstream model. */
 export function buildMapResponse(): Record<string, string> {
   return { ...ALIAS_TO_MODEL };
 }

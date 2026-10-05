@@ -21,8 +21,8 @@ describe('worker routing', () => {
     expect(body.object).toBe('list');
     const ids = body.data.map((m: any) => m.id);
     // Aliases only — real upstream IDs must never leak here.
-    expect(ids).toContain('claude-opus-1');
-    expect(ids).toContain('claude-opus-2');
+    expect(ids).toContain('claude-opus-x-1');
+    expect(ids).toContain('claude-opus-x-2');
     for (const id of ids) {
       expect(id).not.toContain('-free');
     }
@@ -40,17 +40,17 @@ describe('worker routing', () => {
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(body.has_more).toBe(false);
-    expect(body.data[0].id).toBe('claude-opus-1');
+    expect(body.data[0].id).toBe('claude-opus-x-1');
   });
 
-  it('serves the public alias map on /map without an API key', async () => {
+  it('serves the public alias map on /v1/map without an API key', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch');
 
-    const response = await worker.fetch(new Request('https://proxy.example/map'));
+    const response = await worker.fetch(new Request('https://proxy.example/v1/map'));
     const body: any = await response.json();
 
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(body['claude-opus-1']).toContain('-free');
+    expect(body['claude-opus-x-1']).toContain('-free');
   });
 
   it('forwards Anthropic beta header when translating OpenAI requests to Anthropic', async () => {
@@ -163,18 +163,18 @@ describe('worker routing', () => {
       const body: any = await response.json();
       expect(response.status).toBe(200);
       expect(body.data.length).toBeGreaterThan(0);
-      expect(body.data[0].id).toBe('claude-opus-1');
+      expect(body.data[0].id).toBe('claude-opus-x-1');
     }
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('serves the alias map on /go/map and /zen/map without an API key', async () => {
+  it('serves the alias map on /go/v1/map and /zen/v1/map without an API key', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch');
 
-    for (const url of ['https://proxy.example/go/map', 'https://proxy.example/zen/map']) {
+    for (const url of ['https://proxy.example/go/v1/map', 'https://proxy.example/zen/v1/map']) {
       const response = await worker.fetch(new Request(url));
       const body: any = await response.json();
-      expect(body['claude-opus-1']).toContain('-free');
+      expect(body['claude-opus-x-1']).toContain('-free');
     }
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -195,7 +195,7 @@ describe('worker routing', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': key },
       body: JSON.stringify({
-        model: 'claude-opus-1',
+        model: 'claude-opus-x-1',
         messages: [{ role: 'user', content: 'hi' }],
       }),
     });
@@ -205,7 +205,7 @@ describe('worker routing', () => {
     // Upstream gets the real free model...
     expect(capturedBody.model).toContain('-free');
     // ...but the client sees its alias echoed back.
-    expect(body.model).toBe('claude-opus-1');
+    expect(body.model).toBe('claude-opus-x-1');
   });
 
   it('overrides model from URL path segment with /go prefix', async () => {
