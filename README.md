@@ -254,7 +254,17 @@ The API key is validated locally before any upstream call. Missing or short keys
 
 ### OpenCode Identity (avoids the free-tier 403)
 
-OpenCode's free tier rejects requests that don't look like they come from within OpenCode (`403 OpenCode's free tier can only be used from within OpenCode`). The Worker therefore sends the official client's `User-Agent` (`opencode/stable/<version>/opencode`) on every upstream call, where `<version>` tracks the latest stable [anomalyco/opencode release](https://github.com/anomalyco/opencode/releases) via the GitHub API (cached 5 minutes per isolate, falls back to a built-in version if GitHub is unreachable).
+OpenCode's free tier rejects requests that don't look like they come from within OpenCode (`403 OpenCode's free tier can only be used from within OpenCode`). The Worker therefore sends the official client's identity headers on every upstream call:
+
+| Upstream header | Value |
+|-----------------|-------|
+| `User-Agent` | `opencode/stable/<version>/opencode`, where `<version>` tracks the latest stable [anomalyco/opencode release](https://github.com/anomalyco/opencode/releases) via the GitHub API (cached 5 minutes per isolate, falls back to a built-in version if GitHub is unreachable) |
+| `x-opencode-client` | `opencode` |
+| `x-opencode-session-id` | `ses_...` (generated per request) |
+| `x-opencode-session` / `x-session-affinity` / `X-Session-Id` | session affinity (generated per request) |
+| `x-opencode-project` | `global` |
+
+If the incoming request already carries any of these headers (e.g. a real OpenCode client calling through the proxy), its values pass through untouched.
 
 Optional Worker secret (set via `npx wrangler secret put GITHUB_API_KEY` or the Cloudflare dashboard — never commit it):
 

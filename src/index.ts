@@ -84,11 +84,47 @@ function upstreamUserAgent(request: Request, version: string): string {
   return ua && ua.startsWith("opencode/") ? ua : openCodeUserAgent(version);
 }
 
+function randomId(prefix: string, len = 26): string {
+  const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  const bytes = crypto.getRandomValues(new Uint8Array(len));
+  return prefix + Array.from(bytes, (b) => chars[b % chars.length]).join("");
+}
+
+/**
+ * Identity headers the official OpenCode client sends on every chat request
+ * (see the LLM.request http headers in opencode's
+ * packages/core/src/session/model-request.ts). The free-tier gate looks for
+ * these — a bare request without them gets
+ * `403 OpenCode's free tier can only be used from within OpenCode`.
+ * The caller's values pass through untouched when present; otherwise
+ * official-looking values are synthesized.
+ */
+function openCodeIdentityHeaders(request: Request): Record<string, string> {
+  const get = (name: string) => request.headers.get(name);
+  const sessionId = get("x-opencode-session-id") || randomId("ses_");
+  const affinity = get("x-session-affinity") || get("x-session-id") || get("x-opencode-session") || sessionId;
+  const headers: Record<string, string> = {
+    "x-opencode-session-id": sessionId,
+    "x-session-affinity": affinity,
+    "X-Session-Id": affinity,
+    "x-opencode-session": affinity,
+    "x-opencode-client": get("x-opencode-client") || "opencode",
+    "x-opencode-project": get("x-opencode-project") || "global",
+  };
+  const parent = get("x-opencode-parent-session-id") || get("x-parent-session-id");
+  if (parent) {
+    headers["x-opencode-parent-session-id"] = parent;
+    headers["x-parent-session-id"] = parent;
+  }
+  return headers;
+}
+
 function openaiHeaders(request: Request, key: string, ua: string): Record<string, string> {
   return {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${key}`,
     "User-Agent": ua,
+    ...openCodeIdentityHeaders(request),
   };
 }
 
@@ -98,6 +134,7 @@ function anthropicHeaders(request: Request, key: string, ua: string): Record<str
     "X-Api-Key": key,
     "Anthropic-Version": request.headers.get("Anthropic-Version") || "2023-06-01",
     "User-Agent": ua,
+    ...openCodeIdentityHeaders(request),
   };
   const beta = request.headers.get("Anthropic-Beta");
   if (beta) headers["Anthropic-Beta"] = beta;

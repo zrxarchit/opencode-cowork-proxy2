@@ -162,6 +162,48 @@ describe('worker routing', () => {
     }));
   });
 
+  it('sends OpenCode identity headers on upstream chat requests', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => chatOk());
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    await worker.fetch(request);
+
+    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/chat/completions', expect.objectContaining({
+      headers: expect.objectContaining({
+        'x-opencode-client': 'opencode',
+        'x-opencode-session-id': expect.stringMatching(/^ses_/),
+        'x-opencode-session': expect.any(String),
+        'x-session-affinity': expect.any(String),
+      }),
+    }));
+  });
+
+  it('passes through caller-provided OpenCode identity headers', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => chatOk());
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': key,
+        'x-opencode-session-id': 'ses_customsession123',
+        'x-opencode-client': 'opencode',
+      },
+      body: JSON.stringify({ model: 'claude-opus-x-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    await worker.fetch(request);
+
+    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/chat/completions', expect.objectContaining({
+      headers: expect.objectContaining({ 'x-opencode-session-id': 'ses_customsession123' }),
+    }));
+  });
+
   it('builds the upstream User-Agent from the latest stable GitHub release', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any, init: any) => {
       if (String(url).includes('api.github.com')) {
